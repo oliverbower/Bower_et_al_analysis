@@ -1,0 +1,511 @@
+Human embryo single cell analysis for Bower et al.
+Integration of OB NANOG targeted cells with Petropolous 2015 E5, E6, Meistermann 2021,
+Blakeley 2015
+
+
+```{r}
+# Load libraries, working directory, plotting variables
+library(tidyverse)
+library(Seurat)
+library(RColorBrewer)
+library(BiocManager)
+library(EnhancedVolcano)
+library(pheatmap)
+library(DESeq2)
+
+my_point_size = 3
+
+homozygous_embryos = c("4", "7", "8")
+mosaic_embryos = c("1", "2", "3", "5", "6",
+                   "9", "10", "11")
+AAVS1_embryos = c("AAVS1_Em1", "AAVS1_Em2")
+
+```
+
+```{r}
+
+# Define paths to STARsolo outputs for each study
+sample_dirs <- list(
+  blae6 = "PathTo10XFiles",
+  meie6 = "PathTo10XFiles",
+  pete5 = "PathTo10XFiles",
+  pete6 = "PathTo10XFiles",
+  OBAll = "PathTo10XFiles"
+)
+
+# Metadata file paths for each study. Ensure same order as above
+metadata_files <- list(
+  blae6 = "PathTo10XFilesMetadata.txt",
+  meie6 = "PathTo10XFilesMetadata.txt",
+  pete5 = "PathTo10XFilesMetadata.txt",
+  pete6 = "PathTo10XFilesMetadata.txt",
+  BOWDataAll = "PathTo10XFilesMetadata.txt"
+)
+
+```
+
+```{r}
+# Create Seurat objects for all studies and assign study metadata
+seurat_list <- lapply(names(sample_dirs), function(study) {
+  print(paste("Running study:", study))
+  data <- Read10X(
+    data.dir = sample_dirs[[study]],
+    gene.column = 2
+  )
+  seu <- CreateSeuratObject(counts = data, project = study, min.cells = 0, min.features = 200)
+  seu$study <- study
+  seu
+})
+
+# Prints dimensions of the generated R object (features x cells)
+for (i in seq_along(seurat_list)) {
+  cat("\nStudy:", seurat_list[[i]]$study[1], "\n")
+  print(dim(seurat_list[[i]]))
+}
+
+```
+
+```{r}
+# QC and filtering
+
+seurat_list <- lapply(seurat_list, function(seu) {
+  seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^MT-")
+  
+  # Add ribosomal content 
+  seu[["percent.ribo"]] <- PercentageFeatureSet(seu, pattern = "^RPS|^RPL")
+  
+  # QC violin plot before filtering
+  qc_plot_before <- VlnPlot(
+    seu, 
+    features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"), 
+    ncol = 4
+  ) + patchwork::plot_annotation(title = paste("QC BEFORE filtering -", unique(seu$study)))
+  print(qc_plot_before)
+  
+  
+  cells_to_keep <- WhichCells(seu, expression = nCount_RNA > 20000 & nFeature_RNA > 1000 & percent.mt < 20 & 
+                                percent.ribo < 20 )
+  message(sprintf("Sample %s: %d / %d cells retained after filtering", unique(seu$study), length(cells_to_keep), ncol(seu)))
+  
+  if (length(cells_to_keep) == 0) {
+    warning(sprintf("No cells retained for sample %s after QC filtering. Skipping.", unique(seu$study)))
+    return(NULL)  # If no cells are retained, return NULL
+  }
+  
+  # Subset Seurat object and normalize
+  seu <- subset(seu, cells = cells_to_keep)
+  seu <- NormalizeData(seu)
+  seu <- FindVariableFeatures(seu)
+  
+  # Generate QC violin plot for the QC'ed Seurat object
+  qc_plot_after <- VlnPlot(
+    seu, 
+    features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"), 
+    ncol = 4
+  ) + patchwork::plot_annotation(title = paste("QC AFTER filtering -", unique(seu$study)))
+  print(qc_plot_after)
+  
+  return(seu)  
+})
+
+# Remove NULL entries from list after filtering
+seurat_list <- Filter(Negate(is.null), seurat_list)
+```
+
+```{r}
+# Add metadata to each object, use mapping to standardise names across datasets
+
+# Add metadata to individual Seurat objects
+seurat_list <- lapply(seq_along(seurat_list), function(i) {
+  study <- names(metadata_files)[i]  
+  seu <- seurat_list[[i]]     
+  
+  # Load metadata for the study
+  metadata <- read.delim(metadata_files[[study]], header = TRUE, sep = "\t")
+  
+  # Define candidate columns across meta tables and their desired standard names
+  rename_map <- list(
+    cell_id = c("cell_id", "Cell_ID", "Run"),  # All possible identifiers
+    embryo = c("individual", "Individual", "embryo_number")
+    )
+  
+  # Pick existing columns and rename to standardized names
+  selected_metadata <- metadata
+  for (std_name in names(rename_map)) {
+    candidates <- rename_map[[std_name]]
+    matched <- intersect(candidates, colnames(metadata))
+    if (length(matched) > 0) {
+      selected_metadata[[std_name]] <- metadata[[matched[1]]]
+    }
+  }
+  
+  # Error if no 'cell_id' to match with Seurat cells
+  if (!"cell_id" %in% colnames(selected_metadata)) {
+    stop(paste("No valid 'cell_id' column found for study:", study))
+  }
+
+  # Remove duplicated cell IDs, and set as rownames
+  selected_metadata <- dplyr::distinct(selected_metadata, cell_id, .keep_all = TRUE)
+  rownames(selected_metadata) <- selected_metadata$cell_id
+  
+  # Subset to cells in Seurat object
+  selected_metadata <- selected_metadata[Cells(seu), , drop = FALSE]
+  
+  # Add metadata
+  seu <- AddMetaData(seu, metadata = selected_metadata)
+  seu
+})
+
+```
+
+```{r}
+# Check the integrity of layers after merging (each dataset should have a counts and data slot)
+
+lapply(seurat_list, function(x) {
+  assay <- x[["RNA"]]
+  names(assay@layers)
+})
+```
+
+```{r}
+# Integration with Seurat SelectIntegrationFeatures()
+
+features <- SelectIntegrationFeatures(object.list = seurat_list, nfeatures=2000)
+seurat_list <- lapply(seurat_list, function(seu) {
+  seu <- ScaleData(seu, features = features, verbose = FALSE)
+  seu <- RunPCA(seu, features = features, verbose = FALSE, npcs = 50)
+  seu
+})
+
+sapply(seurat_list, function(seu) ncol(seu[["pca"]]@cell.embeddings))
+
+anchors <- FindIntegrationAnchors(object.list = seurat_list, anchor.features = features, k.filter = 50)
+
+integrated_seu <- IntegrateData(anchorset = anchors, k.weight = 50)
+
+
+```
+
+```{r}
+# Simplify the metadata of the integrated object. Assign groups for plotting
+
+# Define the columns you want to keep
+keep_cols <- c("orig.ident", "nCount_RNA", "nFeature_RNA",
+               "study", "percent.mt", "percent.ribo",
+               "cell_id", "Description", "Individual",
+               "Experiment", "embryo",
+               "cell", "Developmental_Stage", "individual", "lineage")
+
+# Subset the metadata slot
+integrated_seu@meta.data <- integrated_seu@meta.data[, keep_cols, drop = FALSE]
+
+# Add column for whole embryo targeting status
+integrated_seu$targeting_status <- dplyr::case_when(
+  integrated_seu$Individual %in% mosaic_embryos ~ "NANOG mosaic",
+  integrated_seu$Individual %in% homozygous_embryos  ~ "NANOG homozygous",
+  integrated_seu$Individual %in% AAVS1_embryos ~ "AAVS1 targeted",
+  is.na(integrated_seu$Individual) ~ "Published dataset",
+  TRUE ~ "Unknown"  # Optional catch-all
+)
+
+
+integrated_seu$PlottingAssist <- dplyr::case_when(
+  integrated_seu$targeting_status %in% c("AAVS1 targeted") ~ "ControlAAVS1",
+  integrated_seu$targeting_status %in% c("Published dataset") ~ "ControlAAVS1",
+  integrated_seu$targeting_status %in% c("NANOG homozygous") ~ "NANOG homozygous",
+    integrated_seu$targeting_status %in% c("NANOG mosaic") ~ "NANOG mosaic"
+  )
+
+# Add published dataset annotation to non-experimental cells
+integrated_seu$Individual <- as.character(integrated_seu$Individual)
+integrated_seu$Individual[is.na(integrated_seu$Individual)] <- "Published dataset"
+
+# Pick out cells for plotting
+cells_published <- WhichCells(integrated_seu, expression = Individual == "Published dataset")
+cells_mosaic <- WhichCells(integrated_seu, expression = targeting_status == "NANOG mosaic")
+cells_homozygous <- WhichCells(integrated_seu, expression = targeting_status == "NANOG homozygous")
+cells_Untargeted <- WhichCells(integrated_seu, expression = targeting_status == "Untargeted")
+cells_AAVS1 <- WhichCells(integrated_seu, expression = targeting_status == "AAVS1 targeted")
+cellsOB <- WhichCells(integrated_seu, expression = study == "OBAll")
+
+
+```
+
+```{r}
+# Run PCA, Neighbors and Clustering
+
+set.seed(42)  # Set seed for reproducibility
+
+# Downstream analysis
+DefaultAssay(integrated_seu) <- "integrated"
+integrated_seu <- ScaleData(integrated_seu, verbose = FALSE)
+integrated_seu <- RunPCA(integrated_seu, verbose = FALSE)
+
+# Generate an elbow plot
+ElbowPlot(integrated_seu, ndims = 50) +
+  ggtitle("Elbow Plot for Integrated Data")
+
+# Cluster
+dims_to_use <- 1:10
+integrated_seu <- FindNeighbors(integrated_seu, dims = dims_to_use)
+integrated_seu <- RunUMAP(integrated_seu, dims = dims_to_use)
+integrated_seu <- FindClusters(integrated_seu, resolution = 0.5)
+
+```
+
+```{r}
+# Plots for data exploration
+
+plot_umap <- function(seurat_obj, group_by, label = TRUE, point_size = 1) {
+  DimPlot(
+    seurat_obj,
+    reduction = "umap",
+    label = label,
+    group.by = group_by,
+    pt.size = point_size
+  ) + theme_minimal()
+}
+
+groups_to_plot <- c("seurat_clusters", "Individual", "study", "embryo", "targeting_status",
+                    "orig.ident", "lineage")
+
+plots <- lapply(groups_to_plot, function(g) {
+  plot_umap(integrated_seu, group_by = g, label = TRUE, point_size = my_point_size)
+})
+
+plots[[1]]
+
+feature_plot_genes <- c("POU5F1", "NANOG", "FGF4", "SOX17", "GATA4", "GATA6", "GATA3")
+FeaturePlot(integrated_seu, features = feature_plot_genes, pt.size = my_point_size)
+
+# PrE Markers
+DotPlot(integrated_seu, features = c('SOX17', 'GATA4', 'PDGFRA', 'HNF4A', 'FOXA2', 'GATA6', 'EOMES', 'APOA1', 'LAMB1', 'COL4A1', 'LAMA1', 'RSPO3', 'OTX2', 'APOA4'), group.by = "seurat_clusters")
+
+# EPI Markers
+DotPlot(integrated_seu, features = c('NANOG', 'VIM',  'BMP4', 'SOX2', 'POU5F1', 'APOE', 'KLF2', 'SALL4', 'HAND1', 'PAX6', 'NODAL', 'FGF2', 'KLF17'), group.by = "seurat_clusters")
+
+DotPlot(integrated_seu, features = c('GATA3', 'GATA2', 'DAB2', 'GRHL1', 'OVOL1', 'SFN', 'ELF3', 'TFAP2A', 'CDX2', 'CLDN4', 'OCLN', 'KRT18', 'FABP3', 'PLAC8', 'YAP1', 'ELF5', 'CGA'), group.by = "seurat_clusters")
+
+# Default assay after integration
+DefaultAssay(integrated_seu)
+DefaultAssay(integrated_seu) <- "integrated"
+# Assay to use for DE
+DefaultAssay(integrated_seu) <- "RNA"
+
+```
+
+
+Figure Plots
+```{r}
+# Plots for figure generation (metadata)
+
+DefaultAssay(integrated_seu) <- "RNA"
+
+# Dimplot for NANOG targeted cells
+DimPlot(integrated_seu, reduction = "umap",
+        cells.highlight = list(
+          'AAVS1 edited embryos' = cells_AAVS1,
+          `Homozygous edited embryos` = cells_homozygous,
+          `Mosaic edited embryos` = cells_mosaic
+          ),
+        cols.highlight = c("orange2", "red2", "#459395"),
+        sizes.highlight = my_point_size,
+        cols = "gray80") +
+  theme_classic()
+
+
+# Coloured feature plots
+FeaturePlot(integrated_seu, features = c('POU5F1'), pt.size = my_point_size) +
+  scale_colour_gradientn(colours = c("darkslateblue", "cyan4", "yellow"))
+
+```
+
+Figure Plots
+```{r}
+# Plots for figure generation (lineage)
+DefaultAssay(integrated_seu) <- "RNA"
+
+# Manually selecting cells
+plot <- DimPlot(integrated_seu, group.by = "seurat_clusters", label = TRUE)
+plot <- DimPlot(integrated_seu, group.by = "lineage", label = TRUE)
+
+# Select extraneous cells in a cluster
+PrEselected_cells <- CellSelector(plot=plot)
+EPIselected_cells <- CellSelector(plot=plot)
+ICMselected_cells <- CellSelector(plot=plot)
+
+# Assign lineage column
+integrated_seu$lineage <- NA
+te_clusters <- c("0", "1", "3", "4", "7")
+te_cells <- WhichCells(integrated_seu, idents = te_clusters)
+integrated_seu$lineage[te_cells] <- "Trophectoderm"
+epi_cells <- WhichCells(integrated_seu, idents = "5")
+integrated_seu$lineage[epi_cells] <- "Epiblast"
+pre_cells <- WhichCells(integrated_seu, idents = "6")
+integrated_seu$lineage[pre_cells] <- "Primitive endoderm"
+icm_cells <- WhichCells(integrated_seu, idents = "2")
+integrated_seu$lineage[icm_cells] <- "ICM"
+
+
+# Add manually selected cells
+integrated_seu$lineage_original <- integrated_seu$lineage
+
+integrated_seu$lineage[PrEselected_cells] <- "Primitive endoderm"
+integrated_seu$lineage[EPIselected_cells] <- "Epiblast"
+integrated_seu$lineage[ICMselected_cells] <- "ICM"
+
+# Track which cells were changed
+meta <- integrated_seu@meta.data
+change_df <- data.frame(
+  Cell = rownames(meta),
+  lineage_before = meta$lineage_original,
+  lineage_after  = meta$lineage,
+  stringsAsFactors = FALSE
+)
+
+changed_cells <- change_df[
+  change_df$lineage_before != change_df$lineage_after,
+]
+
+change_summary <- table(
+  Before = changed_cells$lineage_before,
+  After  = changed_cells$lineage_after
+)
+change_summary
+
+
+integrated_seu$PlottingAssistWithLineage <- paste(
+  integrated_seu$PlottingAssist,
+  integrated_seu$lineage
+)
+
+# Dimplot for lineage clusters
+DimPlot(integrated_seu, reduction = "umap", label = FALSE,
+        group.by = "lineage",
+        cols = c("Epiblast" = "green3",
+                 "Primitive endoderm" = "firebrick1",
+                 "Trophectoderm" = "dodgerblue",
+                 "ICM" = "orange"),
+        pt.size = my_point_size)+
+  theme_classic()
+
+```
+
+Differential Expression
+```{r}
+# Differential expression analysis- preparation
+set.seed(42)
+
+# Target only BOW cells
+cells_keep <- c(cells_AAVS1, cells_homozygous)
+ob_ds <- subset(integrated_seu, cells = cells_keep)
+
+table(ob_ds$PlottingAssist)
+table(ob_ds$PlottingAssistWithLineage)
+
+Idents(ob_ds) <- "PlottingAssist"
+ob_ds <- JoinLayers(ob_ds)
+
+# Filter minimum counts
+ob_ds <- subset(ob_ds, features = rownames(ob_ds)[Matrix::rowSums(ob_ds[["RNA"]]$counts > 1) > 15])
+
+```
+
+```{r}
+# Differential expression analysis- all cells, ICM lineages, TE lineages
+Idents(ob_ds) <- "PlottingAssist"
+de_markersAllCells <- FindMarkers(
+  object = ob_ds,
+  test.use = "MAST",
+  latent.vars = "Individual",
+  ident.1 = "NANOG homozygous",
+  ident.2 = "ControlAAVS1",
+  min.pct = 0.1
+)
+de_markersAllCells <- rownames_to_column(de_markersAllCells, var = "Gene")
+
+Idents(ob_ds) <- "PlottingAssistWithLineage"
+
+de_markersOBCellsICMLineages <- FindMarkers(
+  object = ob_ds,
+  test.use = "MAST",
+  latent.vars = "Individual",
+  ident.1 = c("NANOG homozygous Primitive endoderm", "NANOG homozygous ICM"),
+  ident.2 = c("ControlAAVS1 Primitive endoderm", "ControlAAVS1 Epiblast", "ControlAAVS1 ICM"),
+)
+de_markersOBCellsICMLineages <- rownames_to_column(de_markersOBCellsICMLineages, var = "Gene")
+
+de_markersOBCellsTEOnly <- FindMarkers(
+  object = ob_ds,
+  test.use = "MAST",
+  latent.vars = "Individual",
+  ident.1 = "NANOG homozygous Trophectoderm",
+  ident.2 = "ControlAAVS1 Trophectoderm"
+)
+de_markersOBCellsTEOnly <- rownames_to_column(de_markersOBCellsTEOnly, var = "Gene")
+
+
+#write.csv(de_markersAllCells, "", row.names = FALSE)
+#write.csv(de_markersOBCellsICMLineages, "", row.names = FALSE)
+#write.csv(de_markersOBCellsTEOnly, "", row.names = FALSE)
+
+MarkersOfInterest <- c("")
+
+EnhancedVolcano(de_markersAllCells,
+   lab = de_markersAllCells$Gene,
+   selectLab = MarkersOfInterest,
+    x = 'avg_log2FC',
+    y = 'p_val_adj',
+    title = 'Upregulated NANOG homozygous embryos (right) compared to AAVS1 embryos',
+    pCutoff = 50e-3,
+    FCcutoff = 0.5,
+    pointSize = 2.5,
+    labSize = 4.0,
+    boxedLabels = TRUE,
+    drawConnectors = TRUE,
+    col = c("grey30", "royalblue1", "royalblue", "red2")
+    )
+
+# Extract significant markers
+de_markersFiltered <- de_markersAllCells %>%
+  filter(p_val_adj < 0.10)
+de_markersFilteredDown <- de_markersFiltered %>%
+  filter(avg_log2FC < 0)
+de_markersFilteredUp <- de_markersFiltered %>%
+  filter(avg_log2FC > 0)
+paste(de_markersFilteredDown$Gene, collapse = ", ")
+
+#write.csv(de_markersFilteredDown, "", row.names = FALSE)
+#write.csv(de_markersFilteredUp, "", row.names = FALSE)
+
+```
+
+
+
+```{r}
+# Dotplots- by targeting group and by lineage
+
+DotPlot(integrated_seu, cluster.idents = TRUE, scale = TRUE,
+        group.by = c("targeting_status", "lineage"),
+        features = c("NANOG", "SOX2", "POU5F1", "POU5F1B", "ETV4", "ETV5", "FGF4", "ZFP42", "VENTX", "STAT3", "PRDM14",
+                     "KLF4",
+                     "GATA6", "GATA4", "SOX17", "PDGFRA", "HNF1B", "FGFR2", "FOXA2", "PITX2",
+                     "GATA3", "PDGFA", "LRP2", "CDX2", "GATA2", "KRT18", "TEAD4", "YAP1", "TFAP2C")) +
+    scale_colour_gradientn(colours = c("darkorchid4", "darkslateblue", "cyan4", "mediumseagreen", "yellow")) +
+  RotatedAxis()
+
+
+DotPlot(integrated_seu %>% 
+          subset(subset = targeting_status == "NANOG mosaic", invert = TRUE),
+        cluster.idents = FALSE, scale = TRUE,
+        group.by = "PlottingAssistWithLineage",
+        col.min = -5,
+        features = c("NANOG", "SOX2", "POU5F1", "POU5F1B", "ETV4", "ETV5", "FGF4", "ZFP42", "VENTX", "STAT3", "PRDM14",
+                     "KLF4",
+                     "GATA6", "GATA4", "SOX17", "PDGFRA", "HNF1B", "FGFR2", "FOXA2", "PITX2",
+                     "GATA3", "PDGFA", "LRP2", "CDX2", "GATA2", "KRT18", "TEAD4", "YAP1", "TFAP2C")) +
+    scale_colour_gradientn(colours = c("darkorchid4", "darkslateblue", "cyan4", "mediumseagreen", "yellow")) +
+  RotatedAxis()
+
+```
+
