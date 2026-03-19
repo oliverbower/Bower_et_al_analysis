@@ -1,0 +1,97 @@
+```{r}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+library(tidyr)
+library(tibble)
+library(stringr)
+```
+
+```{r}
+# Assign directories
+# Ensure that .tsv files have columns annotated
+
+input_dir <- "DirectoryWithFullMergedFiles"
+
+output_dir <- "OutputDirectory"
+dir.create(output_dir, showWarnings = TRUE, recursive = TRUE)  # create output dir if it doesn't exist
+
+files <- list.files(path = input_dir)
+
+
+MinimumReadNumber <- 50
+```
+
+
+
+```{r}
+for (file in files) {
+  input_file <- file.path(input_dir, file)
+  bamreadcounts_treated_vs_control <- read_tsv(input_file)
+  
+  # filter by minimum read number in control or treated
+  bamreadcounts_treated_vs_control %>% 
+    filter(total_reads.control > MinimumReadNumber |
+             total_reads.treated > MinimumReadNumber) %>%
+    filter(nchar(REF) == 1 & 
+             nchar(ALT) == 1) %>%
+    # calculate fractions of edits in Control and Treated
+    mutate("snv" = paste0(REF,"_",ALT),
+             "frac_ref_in_control" = case_when(REF == "C" ~ C.control/total_reads.control, 
+                                               REF == "G" ~ G.control/total_reads.control,
+                                               REF == "A" ~ A.control/total_reads.control,
+                                               REF == "T" ~ T.control/total_reads.control,
+                                               TRUE ~ 0),
+             "frac_ref_in_beOverexp" = case_when(REF == "C" ~ C.treated/total_reads.treated, 
+                                                 REF == "G" ~ G.treated/total_reads.treated,
+                                                 REF == "A" ~ A.treated/total_reads.treated,
+                                                 REF == "T" ~ T.treated/total_reads.treated,
+                                                 TRUE ~ 0)) -> bamreadcounts_treated_vs_control_manhattan 
+    # Calculate fraction altered
+    bamreadcounts_treated_vs_control_manhattan <- bamreadcounts_treated_vs_control_manhattan %>%
+      mutate("frac_alt_in_control" = 1 - frac_ref_in_control)
+    
+    bamreadcounts_treated_vs_control_manhattan <- bamreadcounts_treated_vs_control_manhattan %>%
+      mutate("frac_alt_in_beOverexp" = 1 - frac_ref_in_beOverexp)  
+    
+    # Perform summary counts of SNPs observed in each condition
+    bamreadcounts_treated_vs_control_manhattan_counts <- bamreadcounts_treated_vs_control_manhattan %>%
+      group_by(read_status, snv) %>%
+      dplyr::count(snv)
+    
+    # Convert fractions to percentages
+    df_basechange <- bamreadcounts_treated_vs_control_manhattan %>%
+      mutate(
+        editing_pct_treated = frac_alt_in_beOverexp * 100,
+        editing_pct_control = frac_alt_in_control * 100
+        )
+    
+    # Pivot longer for each base edit percentage
+    df_long <- df_basechange %>%
+      select(editing_pct_control, editing_pct_treated, snv, read_status, poskey, chr, POS) %>%
+      pivot_longer(
+        cols = c(editing_pct_control, editing_pct_treated),
+        names_to = "condition",
+        values_to = "editing_pct"
+        ) %>%
+      mutate(
+        condition = recode(
+          condition,
+          editing_pct_control = "Control",
+          editing_pct_treated = "ABE-treated"
+          )) %>%
+      mutate(full_condition = paste0(read_status, "_", condition))
+    
+    df_long <- na.omit(df_long)
+    
+    # Write output
+    write_tsv(bamreadcounts_treated_vs_control_manhattan,
+              path =paste0(output_dir, basename(file), ".all_snvs.stringent.txt"))
+    write_tsv(bamreadcounts_treated_vs_control_manhattan_counts,
+              path =paste0(output_dir, basename(file),".treated_vs_control_snps.txt" ))
+    write_tsv(df_long,
+              path =paste0(output_dir, basename(file),".base_change_pct.txt" ))}
+
+```
+
