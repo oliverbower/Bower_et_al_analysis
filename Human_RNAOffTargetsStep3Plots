@@ -1,0 +1,234 @@
+
+
+```{r}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(tidyverse)
+```
+Create Figure Plots of observed SNVs in Control and Treated based on tsv.base_change_pct.txt and treated_vs_control_snps.txt files from Step2
+
+```{r}
+# Assign directories
+# Ensure that .tsv files have columns annotated
+
+input_dir <- "PathToOutputOfStep2"
+
+files <- list.files(path = input_dir, pattern = ".tsv.base_change_pct.txt", full.names = TRUE)
+filesCounts <- list.files(path = input_dir, pattern = "treated_vs_control_snps.txt", full.names = TRUE)
+
+
+```
+
+Merge all base change pct files for jitter plots
+```{r}
+# Extract group name from filename for column identity. For example
+# lane8985_AACGTCTG_GCGTCATT_Sample_1_L001.tsv.base_change_pct.txt will become lane8985_AACGTCTG_GCGTCATT_Sample_1_L001
+
+extract_group <- function(file) {
+  basename(file) |>
+    str_remove("^full_merged_") |>
+    str_remove("\\.tsv\\.base_change_pct\\.txt$")
+}
+
+# Merge all .tsv.base_change_pct.txt files in directory for plotting
+merged_df <- map_dfr(
+  files,
+  ~ read_tsv(.x, show_col_types = FALSE) |>
+      mutate(group = extract_group(.x))
+)
+```
+
+Jitter plot- All SNVs all sample pairs
+```{r}
+ggplot(merged_df, aes(x = full_condition, y = editing_pct, color = read_status)) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.4,
+    color = "red"
+  ) +
+  facet_wrap(vars(snv, group), nrow = 12, ncol = 8, scales = "fixed") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=45))
+  ylim(0,100)
+```
+
+Bar chart- Counts of all SNVs for all sample pairs
+```{r}
+extract_group2 <- function(file) {
+  basename(file) |>
+    str_remove("^full_merged_") |>
+    str_remove("\\.tsv\\.treated_vs_control_snps\\.txt$")
+}
+
+# Merge all .tsv.base_change_pct.txt files in directory for plotting
+merged_dfCounts <- map_dfr(
+  filesCounts,
+  ~ read_tsv(.x, show_col_types = FALSE) |>
+      mutate(group = extract_group2(.x))
+)
+
+ggplot(merged_dfCounts) +
+  geom_bar(aes(x = read_status, y = n, fill = read_status), stat = "identity") +
+  facet_wrap(vars(snv, group), nrow = 12, ncol = 8) +
+  theme_classic()
+```
+
+Testing SNVs in both Control and Treated where Control is 95% Wildtype (5%)
+```{r}
+merged_dfBothOnly <- merged_df %>%
+  filter(read_status == "Both") %>%
+  pivot_wider(id_cols = c("snv", "read_status", "poskey", "chr", "POS", "group") , names_from = condition, values_from = editing_pct) %>%
+  filter(Control < 5) %>%
+  pivot_longer(cols = c("Control", "ABE-treated"), names_to = "condition", values_to = "editing_pct")
+
+
+ggplot(merged_dfBothOnly, aes(x = condition, y = editing_pct, color = read_status)) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.4,
+    color = "red"
+  ) +
+  facet_wrap(vars(snv, group), nrow = 12, ncol = 8, scales = "fixed") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=45))
+  ylim(0,100)
+
+```
+
+
+Filter out any common SNVs identified in both groups now that replicates have been added
+```{r}
+read_status_lookup <- merged_df %>%
+  distinct(snv, poskey, condition) %>%
+  group_by(snv, poskey) %>%
+  summarise(
+    read_status2 = case_when(
+      all(condition == "ABE-treated") ~ "Treated_only",
+      all(condition == "Control")     ~ "Control_only",
+      any(condition == "ABE-treated") & any(condition == "Control") ~ "Both"
+    ),
+    .groups = "drop"
+  )
+
+merged_df <- merged_df %>%
+  left_join(read_status_lookup, by = c("snv", "poskey"))
+
+merged_df_exclusives_only <- merged_df %>%
+  filter(!(read_status2 == "Both"))
+```
+
+Plot
+```{r}
+ggplot(merged_df_exclusives_only, aes(x = condition, y = editing_pct, color = read_status)) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.4,
+    color = "red"
+  ) +
+  facet_wrap(vars(snv), nrow = 4, ncol = 3, scales = "fixed") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=45))
+  ylim(0,100)
+  
+merged_df_exclusives_only_counts <- merged_df_exclusives_only %>%
+  group_by(read_status2, snv, condition) %>%
+  summarise(count = n(), mean = mean(editing_pct), sd = sd(editing_pct))
+
+label_df <- merged_df_exclusives_only_counts %>%
+  mutate(
+    label = paste0("n = ", count),
+    y_pos = 95   # fixed position near top; adjust if needed
+  )
+
+
+
+ggplot(
+  merged_df_exclusives_only,
+  aes(x = read_status2, y = editing_pct, color = read_status2)
+) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  ## Mean ± SD
+  geom_errorbar(
+    data = merged_df_exclusives_only_counts,
+    aes(
+      x = read_status2,
+      y = mean,
+      ymin = mean - sd,
+      ymax = mean + sd
+    ),
+    width = 0.2,
+    color = "black",
+    linewidth = 0.6,
+    inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = merged_df_exclusives_only_counts,
+    aes(x = read_status2, y = mean),
+    shape = 18,
+    size = 3,
+    color = "black",
+    inherit.aes = FALSE
+  ) +
+  ## n labels
+  geom_text(
+    data = label_df,
+    aes(
+      x = read_status2,
+      y = y_pos,
+      label = label
+    ),
+    color = "black",
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(vars(snv), nrow = 3, ncol = 4, scales = "fixed") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  ) +
+  ylim(0, 100)
+
+
+```
+
+
+```{r}
+merged_df_exclusives_only %>% filter(
+  snv %in% c("C_G", "A_G", "T_C")
+) %>%
+  write_csv("hESCSourceData.csv")
+
+merged_df_exclusives_only_counts %>% filter(
+  snv %in% c("C_G", "A_G", "T_C")
+) %>%
+  write_csv("hESCSourceDataStats.csv")
+```
+
