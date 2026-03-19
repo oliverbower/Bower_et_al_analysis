@@ -17,7 +17,7 @@ See scripts at https://github.com/aryeelab/RNAseq_BE_editing
 
 ```{r}
 # Assign Raw and Output directory
-vcf_dir <- "PathToRawUnmergedFiles"
+vcf_dir <- "/data/HumanRNAOffTarget"
 output_dir <- "PathToOutputDirectory"
 dir.create(output_dir, showWarnings = TRUE)  # create output dir if it doesn't exist
 
