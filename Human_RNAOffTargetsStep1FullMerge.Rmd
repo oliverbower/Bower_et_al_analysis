@@ -1,0 +1,105 @@
+
+
+```{r}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+library(tidyr)
+library(tibble)
+library(stringr)
+```
+
+Full merge join .vcf output files loop
+.vcf output files are produced using script from Grünewald et al., 2019 Nature
+See scripts at https://github.com/aryeelab/RNAseq_BE_editing
+
+
+```{r}
+# Assign Raw and Output directory
+vcf_dir <- "PathToRawUnmergedFiles"
+output_dir <- "PathToOutputDirectory"
+dir.create(output_dir, showWarnings = TRUE)  # create output dir if it doesn't exist
+
+# Provide your pairs as base names (without the .vcf.sorted.vcf_with_coverage.txt suffix)
+# Control as first value, Treated as second value
+# For example:
+# pairs <- list(
+#   c("lane8985_AACGTCTG_GCGTCATT_Sample_1_L001", "lane8985_TTGCAGAC_ACCACGAT_Sample_4_L001"),
+#   c("lane8985_ACGTTCAG_GCACAACT_Sample_2_L001", "lane8985_CAATGTGG_GTCGAAGA_Sample_5_L001")
+# )
+
+pairs <- list(
+  c("lane8985_AACGTCTG_GCGTCATT_Sample_1_L001", "lane8985_TTGCAGAC_ACCACGAT_Sample_4_L001"),
+  c("lane8985_ACGTTCAG_GCACAACT_Sample_2_L001", "lane8985_CAATGTGG_GTCGAAGA_Sample_5_L001"),
+  c("lane8985_CAGTCCAA_GATTACCG_Sample_3_L001", "lane8985_ACTCCATC_CCTTGATC_Sample_6_L001")
+)
+
+```
+
+
+```{r}
+# Loop over pairs
+
+for (pair in pairs) {
+  control_file <- file.path(vcf_dir, paste0(pair[1], ".vcf.sorted.vcf_with_coverage.txt"))
+  treated_file <- file.path(vcf_dir, paste0(pair[2], ".vcf.sorted.vcf_with_coverage.txt"))
+  
+  # Read files
+  treated <- read_tsv(treated_file,
+                      col_names = c("poskey","chr","POS","other","REF","ALT","QUAL",
+                                    "ref.other","total_reads","A","C","G","T","N"))
+  
+  control <- read_tsv(control_file,
+                      col_names = c("poskey","chr","POS","other","REF","ALT","QUAL",
+                                    "ref.other","total_reads","A","C","G","T","N"))
+  
+  # Merge
+  merged <- full_join(treated, control, by = "poskey", suffix = c(".treated", ".control")) %>%
+    mutate(
+      chr = coalesce(chr.treated, chr.control),
+      POS = coalesce(POS.treated, POS.control),
+      other = coalesce(other.treated, other.control),
+      REF = coalesce(REF.treated, REF.control),
+      ALT = coalesce(ALT.treated, ALT.control),
+#      QUAL = coalesce(QUAL.treated, QUAL.control),
+      ref.other = coalesce(ref.other.treated, ref.other.control)
+    )
+  
+  # Fill numeric NAs with 0
+  num_cols <- c("total_reads.treated","A.treated","C.treated","G.treated","T.treated","N.treated",
+              "total_reads.control","A.control","C.control","G.control","T.control","N.control",
+              "QUAL.treated", "QUAL.control")
+  
+  for (col in num_cols) {
+    if (col %in% colnames(merged)) {
+      merged[[col]][is.na(merged[[col]])] <- 0
+    }
+  }
+  
+  # Select final column order
+  merged <- merged %>%
+    select(poskey, chr, POS, other, REF, ALT, QUAL.control, QUAL.treated, ref.other,
+           total_reads.treated, A.treated, C.treated, G.treated, T.treated, N.treated,
+           total_reads.control, A.control, C.control, G.control, T.control, N.control)
+  
+  merged <- merged %>%
+  mutate(
+    read_status = case_when(
+      total_reads.treated > 0 & total_reads.control == 0 ~ "Treated_only",
+      total_reads.treated == 0 & total_reads.control > 0 ~ "Control_only",
+      total_reads.treated > 0 & total_reads.control > 0 ~ "Both",
+      total_reads.treated == 0 & total_reads.control == 0 ~ "None"
+    )
+  )
+
+  
+  # Write output
+  base_name <- paste0("full_merged_", pair[1])
+  output_file <- file.path(output_dir, paste0(base_name, ".tsv"))
+  write_tsv(merged, output_file)
+  
+  cat("Merged pair:", pair[1], "+", pair[2], "->", output_file, "\n")
+}
+```
+
